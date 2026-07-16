@@ -1,0 +1,19 @@
+{
+  "extends": "intentguard_families.json",
+  "seed": 17,
+  "experiment": {
+    "name": "CISR_v2",
+    "evaluation_protocol": "template_holdout_train_validation_calibration_test"
+  },
+  "dataset": {
+    "text_variants_per_distribution": 6,
+    "semantic_variants": 4,
+    "ocr_variants": 6,
+    "distractor_variants": 4
+  },
+  "images": {
+    "use_same_semantic_for_controls": true,
+    "ocr_image_source": "generated_prompt",
+    "generated_mode": "inside_intent_dir"
+  }
+}

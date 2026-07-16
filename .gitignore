@@ -7,3 +7,15 @@
 /benchmark
 
 /.agents
+
+/jailbreak_repro/runs/
+/jailbreak_repro/sourcecode/*-main/
+/jailbreak_repro/sourcecode/*-main.zip
+
+/runs/*smoke*/
+/runs/codecheck_smoke*/
+/runs/_env_smoke*/
+
+/src/__pycache__/
+__pycache__/
+*.pyc

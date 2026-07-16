@@ -1,0 +1,56 @@
+{
+  "format_version": "CISR_safe_layer_routing_v1",
+  "detector": {
+    "artifact": "runs/CISR_v2/qwen25vl7b/detector/detector.npz",
+    "risk_low": 0.95,
+    "risk_high": 0.98,
+    "notes": "Replace these example values with held-out calibration thresholds."
+  },
+  "safe_refusal_probe": {
+    "artifact": "runs/CISR_v2/qwen25vl7b/refusal_probe/refusal_probe.npz",
+    "refusal_low": 0.3,
+    "refusal_high": 0.7,
+    "label_definition": "refusal_heuristic == true and judge_harmful == false"
+  },
+  "routing": {
+    "extreme_risk": 0.995,
+    "missing_refusal_action": "monitor",
+    "gray_region_action": "monitor_and_verify",
+    "oracle_bypass_routes_every_ground_truth_risk": true
+  },
+  "intervention": {
+    "adapter_artifact": "runs/CISR_v2/qwen25vl7b/intervention/safe_layer_adapter.pt",
+    "module_path": "REPLACE_WITH_MODEL_SPECIFIC_TRANSFORMER_BLOCK_PATH",
+    "detector_hidden_state_index": 20,
+    "module_output_equivalence_required": true,
+    "hidden_size": 3584,
+    "rank": 8,
+    "alpha": 16.0,
+    "dropout": 0.0,
+    "token_scope": "last",
+    "max_route_calls": 9
+  },
+  "training": {
+    "fit_split": "train",
+    "selection_split": "validation",
+    "threshold_split": "calibration",
+    "never_fit_splits": [
+      "calibration",
+      "test"
+    ],
+    "loss_weights": {
+      "safe_ce": 1.0,
+      "teacher": 1.0,
+      "refusal_projection": 0.25,
+      "retain_kl": 1.0,
+      "retain_hidden": 0.25,
+      "semantic_preserve": 0.25,
+      "delta_l2": 0.0001
+    }
+  },
+  "verification": {
+    "early_decode_steps": 8,
+    "bounded_retry_count": 1,
+    "hard_refusal_after_failed_retry": true
+  }
+}

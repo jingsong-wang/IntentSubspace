@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 
+from intentguard.artifacts import activation_archive_errors, format_activation_archive_error
 from intentguard.detector import (
     CISRDetector,
     build_detector_features,
@@ -411,6 +412,9 @@ def main() -> None:
 
     rows = read_jsonl(args.data)
     protocol = validate_protocol(rows)
+    archive_errors = activation_archive_errors(args.activations, expected_rows=rows)
+    if archive_errors:
+        raise ValueError(format_activation_archive_error(args.activations, archive_errors))
     data = np.load(args.activations, allow_pickle=True)
     ids = data["ids"].astype(str)
     if ids.tolist() != [str(row["id"]) for row in rows]:

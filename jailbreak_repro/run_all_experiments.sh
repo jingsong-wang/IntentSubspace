@@ -20,6 +20,7 @@ FIGSTEP_DATASET="safebench"
 JOOD_MAX_SAMPLES=500
 ATTACK_ARTIFACT_ROOT="jailbreak_repro/runs/_shared_attack_artifacts"
 MAX_SAMPLES=""
+CISR_VERSION="cisr2"
 CISR_DETECTOR=""
 CIDER_ENCODER_MODEL="llava-hf/llava-1.5-7b-hf"
 CIDER_ENCODER_SOURCE="hf"
@@ -40,7 +41,7 @@ Run the complete jailbreak reproduction matrix sequentially.
 Matrix:
   attacks:    figstep, csdj, jood
   benchmarks: HADES, jailbreakV-mini, XSTest (attack=none)
-  defenses:   none, ecso, cider, cisr, adashield, hiddendetect
+  defenses:   selected CISR version (cisr2 by default)
 
 Existing victim responses and matching judge results are reused. A changed
 judge prompt changes the judge config hash and automatically triggers judging.
@@ -56,6 +57,7 @@ Options:
   --judge-backend VALUE         Judge backend (default: auto)
   --judge-source VALUE          Judge model source (default: auto)
   --judge-batch-size N          Judge batch size (default: 8)
+  --cisr-version VALUE          cisr2 or cisr3 (default: cisr2)
   --cisr-detector PATH          Matching CISR detector.npz
   --cider-encoder-model VALUE   Fixed auxiliary LLaVA-1.5-7B id/path
   --cider-encoder-source VALUE  hf or modelscope (default: hf)
@@ -76,7 +78,8 @@ Options:
   -h, --help                    Show this help
 
 When --cisr-detector is omitted for a preset, the script tries:
-  runs/CISR_v2/<victim-model>/detector/detector.npz
+  cisr2 -> runs/CISR_v2/<victim-model>/detector/detector.npz
+  cisr3 -> runs/CISR_v3/<victim-model>/detector/detector.npz
 EOF
 }
 
@@ -89,6 +92,7 @@ while (($#)); do
     --judge-backend) JUDGE_BACKEND="$2"; shift 2 ;;
     --judge-source) JUDGE_SOURCE="$2"; shift 2 ;;
     --judge-batch-size) JUDGE_BATCH_SIZE="$2"; shift 2 ;;
+    --cisr-version) CISR_VERSION="$2"; shift 2 ;;
     --cisr-detector) CISR_DETECTOR="$2"; shift 2 ;;
     --cider-encoder-model) CIDER_ENCODER_MODEL="$2"; shift 2 ;;
     --cider-encoder-source) CIDER_ENCODER_SOURCE="$2"; shift 2 ;;
@@ -132,13 +136,18 @@ if [[ "$HIDDENDETECT_ACTION" != "monitor" && "$HIDDENDETECT_ACTION" != "block" ]
   echo "--hiddendetect-action must be monitor or block" >&2
   exit 2
 fi
+if [[ "$CISR_VERSION" != "cisr2" && "$CISR_VERSION" != "cisr3" ]]; then
+  echo "--cisr-version must be cisr2 or cisr3" >&2
+  exit 2
+fi
 if [[ "$ADASHIELD_MODE" == "adaptive" && -z "$ADASHIELD_PROMPT_POOL" ]]; then
   echo "--adashield-mode adaptive requires --adashield-prompt-pool" >&2
   exit 2
 fi
 
 if [[ -z "$CISR_DETECTOR" ]]; then
-  CISR_DETECTOR="runs/CISR_v2/${VICTIM_MODEL}/detector/detector.npz"
+  CISR_RUN_VERSION="${CISR_VERSION#cisr}"
+  CISR_DETECTOR="runs/CISR_v${CISR_RUN_VERSION}/${VICTIM_MODEL}/detector/detector.npz"
 fi
 
 if ((DRY_RUN == 0)); then
@@ -161,6 +170,7 @@ fi
 
 ATTACKS=(figstep csdj jood)
 BENCHMARKS=(HADES jailbreakV-mini XSTest)
+# DEFENSES=("$CISR_VERSION")
 DEFENSES=(adashield)
 TOTAL_RUNS=$(((${#ATTACKS[@]} + ${#BENCHMARKS[@]}) * ${#DEFENSES[@]}))
 RUN_INDEX=0
@@ -208,7 +218,7 @@ run_case() {
   else
     command+=(--benchmark "$source_name")
   fi
-  if [[ "$defense" == "cisr" ]]; then
+  if [[ "$defense" == cisr* ]]; then
     command+=(--cisr-detector "$CISR_DETECTOR")
   elif [[ "$defense" == "cider" ]]; then
     command+=(

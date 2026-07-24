@@ -1,0 +1,128 @@
+{
+  "format_version": "cnrf_source_signal_audit_v1",
+  "readout": "last",
+  "layer": 27,
+  "split": "reference",
+  "pairs": 396,
+  "semantic_source": {
+    "source_axis": "semantic",
+    "raw_endpoints": {
+      "eligible": true,
+      "n": 792,
+      "classes": [
+        "animal_abuse",
+        "bio_chemical",
+        "cyber",
+        "drug",
+        "evasion",
+        "financial_crime",
+        "fraud",
+        "harassment",
+        "privacy",
+        "self_harm",
+        "sexual_exploitation",
+        "violence",
+        "weapon"
+      ],
+      "accuracy": 0.22348484848484848,
+      "macro_f1": 0.23763156148045164,
+      "group_count": 156
+    },
+    "midpoints": {
+      "eligible": true,
+      "n": 396,
+      "classes": [
+        "animal_abuse",
+        "bio_chemical",
+        "cyber",
+        "drug",
+        "evasion",
+        "financial_crime",
+        "fraud",
+        "harassment",
+        "privacy",
+        "self_harm",
+        "sexual_exploitation",
+        "violence",
+        "weapon"
+      ],
+      "accuracy": 0.29545454545454547,
+      "macro_f1": 0.31753972430978633,
+      "group_count": 156
+    },
+    "arrows": {
+      "eligible": true,
+      "n": 396,
+      "classes": [
+        "animal_abuse",
+        "bio_chemical",
+        "cyber",
+        "drug",
+        "evasion",
+        "financial_crime",
+        "fraud",
+        "harassment",
+        "privacy",
+        "self_harm",
+        "sexual_exploitation",
+        "violence",
+        "weapon"
+      ],
+      "accuracy": 0.24494949494949494,
+      "macro_f1": 0.259781653051116,
+      "group_count": 156
+    }
+  },
+  "carrier_source": {
+    "source_axis": "carrier",
+    "raw_endpoints": {
+      "eligible": true,
+      "n": 792,
+      "classes": [
+        "action_semantic_image",
+        "evidence_semantic_image",
+        "figstep_style_ocr_completion",
+        "guided_clean_ocr_image",
+        "image_only_clean_ocr",
+        "mixed_query_multimodal",
+        "text_with_clean_ocr"
+      ],
+      "accuracy": 0.8156565656565656,
+      "macro_f1": 0.8026996901918407,
+      "group_count": 156
+    },
+    "midpoints": {
+      "eligible": true,
+      "n": 396,
+      "classes": [
+        "action_semantic_image",
+        "evidence_semantic_image",
+        "figstep_style_ocr_completion",
+        "guided_clean_ocr_image",
+        "image_only_clean_ocr",
+        "mixed_query_multimodal",
+        "text_with_clean_ocr"
+      ],
+      "accuracy": 0.8712121212121212,
+      "macro_f1": 0.8821202140023754,
+      "group_count": 156
+    },
+    "arrows": {
+      "eligible": true,
+      "n": 396,
+      "classes": [
+        "action_semantic_image",
+        "evidence_semantic_image",
+        "figstep_style_ocr_completion",
+        "guided_clean_ocr_image",
+        "image_only_clean_ocr",
+        "mixed_query_multimodal",
+        "text_with_clean_ocr"
+      ],
+      "accuracy": 0.8282828282828283,
+      "macro_f1": 0.7830794914477615,
+      "group_count": 156
+    }
+  },
+  "interpretation_gate": "The mechanism hypothesis is supported only if arrow source/carrier macro-F1 is materially below endpoint and midpoint macro-F1 under the same grouped folds."
+}

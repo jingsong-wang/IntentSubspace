@@ -1,0 +1,57 @@
+{
+  "format_version": "cnrf_protocol_v2_diverse_axes",
+  "formal_eligible": false,
+  "seed": 20260721,
+  "pair_split_fractions": {
+    "reference": 0.70,
+    "validation": 0.15,
+    "calibration": 0.15
+  },
+  "counterfactual_generation": {
+    "include_native_image": true,
+    "require_human_approval": false,
+    "forbid_answer_generation": true,
+    "retain_original_harmful_request": true,
+    "skip_image_dependent_non_native": true,
+    "variants_per_carrier": 2,
+    "recommended_temperature": 0.7,
+    "recommended_top_p": 0.9,
+    "counterfactual_axes": [
+      "protective_detection_reporting",
+      "non_operational_education",
+      "authorized_defensive_use",
+      "fictional_simulation_or_inert_target",
+      "benign_target_or_polysemy",
+      "recovery_support_remediation"
+    ]
+  },
+  "automatic_quality_gate": {
+    "min_topic_coverage": 0.15,
+    "min_length_ratio": 0.4,
+    "max_length_ratio": 2.5,
+    "reject_image_semantic_mismatch": true,
+    "require_known_axis": true,
+    "deduplicate": true
+  },
+  "risk_field": {
+    "k": 5,
+    "min_arrow_norm": 0.001,
+    "min_field_pairs": 30,
+    "min_field_packs": 30,
+    "min_field_retention_fraction": 0.10,
+    "score_clip": 20.0,
+    "support_quantile": 0.99,
+    "fusion_policy": "supported_max"
+  },
+  "calibration": {
+    "primary_alpha": 0.05,
+    "secondary_alpha": 0.01,
+    "decision_rule": "score_greater_than_or_equal"
+  },
+  "readouts": ["last", "non_image_mean"],
+  "bootstrap": {
+    "iterations": 1000,
+    "unit": "pack_id",
+    "reference_subsamples": 10
+  }
+}

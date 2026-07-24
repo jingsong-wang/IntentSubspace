@@ -1,0 +1,16 @@
+{
+  "extends": "cisr_v3_families.json",
+  "experiment": {
+    "name": "CISR_v4",
+    "evaluation_protocol": "modality_isolated_paired_holdout_with_pooling_selection"
+  },
+  "dataset": {
+    "figstep_style_ocr_variants": 6
+  },
+  "images": {
+    "v3_generated_subdir": "_cisr_v4_generated",
+    "v4_generated_subdir": "_cisr_v4_generated",
+    "perturb_ocr": false,
+    "allow_generated_semantic_assets": false
+  }
+}

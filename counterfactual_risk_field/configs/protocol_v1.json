@@ -1,0 +1,31 @@
+{
+  "format_version": "cnrf_protocol_v1",
+  "seed": 20260721,
+  "pair_split_fractions": {
+    "reference": 0.70,
+    "validation": 0.15,
+    "calibration": 0.15
+  },
+  "counterfactual_generation": {
+    "include_native_image": true,
+    "require_human_approval": true,
+    "forbid_answer_generation": true
+  },
+  "risk_field": {
+    "k": 5,
+    "min_arrow_norm": 0.001,
+    "score_clip": 20.0,
+    "support_quantile": 0.99
+  },
+  "calibration": {
+    "primary_alpha": 0.05,
+    "secondary_alpha": 0.01,
+    "decision_rule": "score_greater_than_or_equal"
+  },
+  "readouts": ["last", "non_image_mean", "image_mean"],
+  "bootstrap": {
+    "iterations": 1000,
+    "unit": "pack_id",
+    "reference_subsamples": 10
+  }
+}

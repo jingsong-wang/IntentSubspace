@@ -131,18 +131,119 @@ def infer_num_layers(model: Any) -> int:
     raise RuntimeError("Could not infer num_hidden_layers from model config.")
 
 
-def pool_hidden(hidden: torch.Tensor, attention_mask: torch.Tensor | None, pooling: str) -> torch.Tensor:
+POOLING_CHOICES = ("last", "mean", "image_mean", "non_image_mean")
+
+
+def _token_id_values(value: Any) -> set[int]:
+    if value is None:
+        return set()
+    if isinstance(value, (list, tuple, set)):
+        values: set[int] = set()
+        for item in value:
+            values.update(_token_id_values(item))
+        return values
+    try:
+        return {int(value)}
+    except (TypeError, ValueError):
+        return set()
+
+
+def image_token_ids(processor: Any, model: Any) -> list[int]:
+    """Resolve explicit image placeholder/token ids without model-name guessing."""
+    ids: set[int] = set()
+    objects = [
+        processor,
+        getattr(processor, "tokenizer", None),
+        getattr(model, "config", None),
+        getattr(getattr(model, "config", None), "text_config", None),
+        getattr(getattr(model, "config", None), "vision_config", None),
+    ]
+    attributes = (
+        "image_token_id",
+        "image_token_index",
+        "image_token_ids",
+        "boi_token_id",
+        "eoi_token_id",
+    )
+    for obj in objects:
+        if obj is None:
+            continue
+        for attribute in attributes:
+            ids.update(_token_id_values(getattr(obj, attribute, None)))
+
+    tokenizer = getattr(processor, "tokenizer", processor)
+    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if callable(convert):
+        unknown = getattr(tokenizer, "unk_token_id", None)
+        for token in (
+            "<|image_pad|>",
+            "<image>",
+            "<|image|>",
+            "<image_soft_token>",
+            "<start_of_image>",
+            "<end_of_image>",
+        ):
+            token_id = convert(token)
+            if token_id is not None and token_id != unknown:
+                ids.update(_token_id_values(token_id))
+    return sorted(token_id for token_id in ids if token_id >= 0)
+
+
+def image_token_mask(
+    batch: dict[str, Any], processor: Any, model: Any, sequence_length: int
+) -> torch.Tensor:
+    input_ids = batch.get("input_ids")
+    if input_ids is None or input_ids.ndim != 2:
+        return torch.zeros((1, sequence_length), dtype=torch.bool)
+    if int(input_ids.shape[1]) != int(sequence_length):
+        raise ValueError(
+            "Cannot align image-token mask with hidden states: "
+            f"input_ids={tuple(input_ids.shape)}, hidden_sequence={sequence_length}."
+        )
+    mask = torch.zeros_like(input_ids, dtype=torch.bool)
+    for token_id in image_token_ids(processor, model):
+        mask |= input_ids == token_id
+    return mask
+
+
+def pool_hidden(
+    hidden: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    pooling: str,
+    image_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     # hidden: [1, seq, dim]
+    if pooling not in POOLING_CHOICES:
+        raise ValueError(f"Unknown pooling mode: {pooling}")
     if attention_mask is None:
-        valid = hidden[0]
+        valid_mask = torch.ones(hidden.shape[1], dtype=torch.bool, device=hidden.device)
     else:
-        mask = attention_mask[0].bool().to(hidden.device)
-        valid = hidden[0, mask]
+        valid_mask = attention_mask[0].bool().to(hidden.device)
+    valid = hidden[0, valid_mask]
     if pooling == "last":
         return valid[-1]
     if pooling == "mean":
         return valid.mean(dim=0)
-    raise ValueError(f"Unknown pooling mode: {pooling}")
+    if image_mask is None:
+        aligned_image_mask = torch.zeros_like(valid_mask)
+    else:
+        if image_mask.ndim != 2 or tuple(image_mask.shape) != (1, hidden.shape[1]):
+            raise ValueError(
+                f"image_mask must have shape (1, {hidden.shape[1]}), got {tuple(image_mask.shape)}"
+            )
+        aligned_image_mask = image_mask[0].bool().to(hidden.device)
+    if pooling == "image_mean":
+        selected = valid_mask & aligned_image_mask
+        if not bool(selected.any()):
+            raise ValueError(
+                "image_mean pooling requires explicit image tokens, but none were found. "
+                "This backend/model may expose vision only through cross-attention."
+            )
+        return hidden[0, selected].mean(dim=0)
+    selected = valid_mask & ~aligned_image_mask
+    if not bool(selected.any()):
+        raise ValueError("non_image_mean pooling found no non-image tokens.")
+    return hidden[0, selected].mean(dim=0)
 
 
 def dtype_from_arg(name: str):
@@ -561,12 +662,16 @@ def extract_qwen_vl_rows(
             hidden_states = output_hidden_states(out)
             if layers is None:
                 layers = resolve_layers_from_hidden(args, hidden_states)
+            primary_image_mask = image_token_mask(
+                batch, processor, model, int(hidden_states[0].shape[1])
+            ).detach().cpu()
             sample_layers = []
             for layer_idx in layers:
                 pooled = pool_hidden(
                     hidden_states[layer_idx].detach().float().cpu(),
                     batch.get("attention_mask", None).detach().cpu() if "attention_mask" in batch else None,
                     args.pooling,
+                    primary_image_mask,
                 )
                 sample_layers.append(pooled.numpy())
             acts.append(np.stack(sample_layers, axis=0))
@@ -587,12 +692,16 @@ def extract_qwen_vl_rows(
                 anchor_batch = move_batch_to_device(dict(anchor_batch), first_param_device(model))
                 anchor_out = model(**anchor_batch, output_hidden_states=True, use_cache=False)
                 anchor_hidden = output_hidden_states(anchor_out)
+                anchor_image_mask = image_token_mask(
+                    anchor_batch, processor, model, int(anchor_hidden[0].shape[1])
+                ).detach().cpu()
                 anchor_layers = []
                 for layer_idx in layers or []:
                     pooled = pool_hidden(
                         anchor_hidden[layer_idx].detach().float().cpu(),
                         anchor_batch.get("attention_mask", None).detach().cpu() if "attention_mask" in anchor_batch else None,
                         args.pooling,
+                        anchor_image_mask,
                     )
                     anchor_layers.append(pooled.numpy())
                 anchor_acts.append(np.stack(anchor_layers, axis=0))
@@ -632,12 +741,16 @@ def extract_generic_vlm_rows(
             hidden_states = output_hidden_states(out)
             if layers is None:
                 layers = resolve_layers_from_hidden(args, hidden_states)
+            primary_image_mask = image_token_mask(
+                batch, processor, model, int(hidden_states[0].shape[1])
+            ).detach().cpu()
             sample_layers = []
             for layer_idx in layers:
                 pooled = pool_hidden(
                     hidden_states[layer_idx].detach().float().cpu(),
                     batch.get("attention_mask", None).detach().cpu() if "attention_mask" in batch else None,
                     args.pooling,
+                    primary_image_mask,
                 )
                 sample_layers.append(pooled.numpy())
             acts.append(np.stack(sample_layers, axis=0))
@@ -658,12 +771,16 @@ def extract_generic_vlm_rows(
                 anchor_batch = move_batch_to_device(dict(anchor_batch), first_param_device(model))
                 anchor_out = model(**anchor_batch, output_hidden_states=True, use_cache=False)
                 anchor_hidden = output_hidden_states(anchor_out)
+                anchor_image_mask = image_token_mask(
+                    anchor_batch, processor, model, int(anchor_hidden[0].shape[1])
+                ).detach().cpu()
                 anchor_layers = []
                 for layer_idx in layers or []:
                     pooled = pool_hidden(
                         anchor_hidden[layer_idx].detach().float().cpu(),
                         anchor_batch.get("attention_mask", None).detach().cpu() if "attention_mask" in anchor_batch else None,
                         args.pooling,
+                        anchor_image_mask,
                     )
                     anchor_layers.append(pooled.numpy())
                 anchor_acts.append(np.stack(anchor_layers, axis=0))
@@ -689,6 +806,32 @@ def infer_backend(args) -> str:
     return "text"
 
 
+def dataset_provenance(rows: list[dict]) -> dict[str, Any]:
+    protocols = sorted(
+        {str(row.get("dataset_protocol") or "").strip() for row in rows}
+        - {""}
+    )
+    fingerprints = sorted(
+        {str(row.get("dataset_manifest_sha1") or "").strip() for row in rows}
+        - {""}
+    )
+    exact_values = {
+        bool(row.get("dataset_exact_protocol"))
+        for row in rows
+        if "dataset_exact_protocol" in row
+    }
+    return {
+        "dataset_protocol": protocols[0] if len(protocols) == 1 else None,
+        "dataset_protocol_values": protocols,
+        "dataset_exact_protocol": (
+            exact_values == {True} if exact_values else None
+        ),
+        "dataset_manifest_sha1": fingerprints[0] if len(fingerprints) == 1 else None,
+        "dataset_manifest_sha1_values": fingerprints,
+        "dataset_row_count": len(rows),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, help="Hugging Face model name or local path.")
@@ -699,7 +842,7 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--backend", choices=["auto", "text", "qwen2_5_vl", "generic_vlm"], default="auto")
     parser.add_argument("--layers", default="mid,last", help="Comma list, e.g. 12,24,last or aliases early,mid,late,last or all.")
-    parser.add_argument("--pooling", choices=["last", "mean"], default="last")
+    parser.add_argument("--pooling", choices=POOLING_CHOICES, default="last")
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, etc.")
     parser.add_argument("--dtype", choices=["auto", "float16", "bfloat16", "float32"], default="auto")
     parser.add_argument("--attn-implementation", choices=["auto", "eager", "sdpa", "flash_attention_2"], default="auto")
@@ -730,15 +873,19 @@ def main() -> None:
 
     rows = load_jsonl(args.data)
     backend = infer_backend(args)
+    provenance = dataset_provenance(rows)
+    resolved_image_token_ids: list[int] = []
 
     if backend == "text":
         tokenizer, model = load_text_backend(args)
         activations, anchor_activations, has_anchor, rendered_prompts, layers = extract_text_rows(args, rows, tokenizer, model)
     elif backend == "qwen2_5_vl":
         processor, model = load_qwen_vl_backend(args)
+        resolved_image_token_ids = image_token_ids(processor, model)
         activations, anchor_activations, has_anchor, rendered_prompts, layers = extract_qwen_vl_rows(args, rows, processor, model)
     elif backend == "generic_vlm":
         processor, model = load_generic_vlm_backend(args)
+        resolved_image_token_ids = image_token_ids(processor, model)
         activations, anchor_activations, has_anchor, rendered_prompts, layers = extract_generic_vlm_rows(args, rows, processor, model)
     else:
         raise ValueError(f"Unsupported backend: {backend}")
@@ -776,9 +923,12 @@ def main() -> None:
                 "model_source": args.model_source,
                 "backend": backend,
                 "pooling": args.pooling,
+                "image_token_ids": resolved_image_token_ids,
                 "layers": layers,
                 "multimodal_anchor": bool(args.multimodal_anchor),
                 "multimodal_anchor_prompt": args.multimodal_anchor_prompt,
+                "source_data": str(args.data.expanduser().resolve()),
+                **provenance,
             },
             ensure_ascii=False,
         ),

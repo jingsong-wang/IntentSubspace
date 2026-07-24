@@ -154,6 +154,31 @@ class BaseModelRunner:
     ) -> HiddenRepresentation:
         raise NotImplementedError(f"{type(self).__name__} does not expose hidden representations")
 
+    def extract_hidden_views(
+        self,
+        prompt: str,
+        views: list[tuple[int, str]],
+        image_path: str | None = None,
+        system_prompt: str | None = None,
+    ) -> list[HiddenRepresentation]:
+        """Extract several layer/readout views for one rendered input.
+
+        Backends may override this method to share one model forward.  The
+        conservative fallback preserves compatibility with lightweight test
+        runners and third-party backends.
+        """
+
+        return [
+            self.extract_hidden(
+                prompt,
+                layer=layer,
+                image_path=image_path,
+                system_prompt=system_prompt,
+                pooling=pooling,
+            )
+            for layer, pooling in views
+        ]
+
     def score_refusal_layers(
         self,
         prompt: str,
@@ -339,6 +364,7 @@ class HFModelRunner(BaseModelRunner):
             first_param_device,
             generic_vlm_process_messages,
             infer_backend,
+            image_token_mask,
             load_generic_vlm_backend,
             load_qwen_vl_backend,
             load_text_backend,
@@ -353,6 +379,7 @@ class HFModelRunner(BaseModelRunner):
             "dtype_from_arg": dtype_from_arg,
             "first_param_device": first_param_device,
             "generic_vlm_process_messages": generic_vlm_process_messages,
+            "image_token_mask": image_token_mask,
             "move_batch_to_device": move_batch_to_device,
             "output_hidden_states": output_hidden_states,
             "pool_hidden": pool_hidden,
@@ -841,10 +868,17 @@ class HFModelRunner(BaseModelRunner):
         attention_mask = (
             batch["attention_mask"].detach().cpu() if "attention_mask" in batch else None
         )
+        image_mask = self._helpers["image_token_mask"](
+            batch,
+            self.processor_or_tokenizer,
+            self.model,
+            int(hidden_states[layer].shape[1]),
+        ).detach().cpu()
         pooled = self._helpers["pool_hidden"](
             hidden_states[layer].detach().float().cpu(),
             attention_mask,
             pooling,
+            image_mask,
         )
         return HiddenRepresentation(
             vector=pooled.numpy(),
@@ -856,8 +890,80 @@ class HFModelRunner(BaseModelRunner):
                 "input_tokens": int(batch["input_ids"].shape[1]) if "input_ids" in batch else None,
                 "image_path_present": bool(image_path),
                 "pooling": pooling,
+                "image_token_count": int(image_mask.sum().item()),
             },
         )
+
+    def extract_hidden_views(
+        self,
+        prompt: str,
+        views: list[tuple[int, str]],
+        image_path: str | None = None,
+        system_prompt: str | None = None,
+    ) -> list[HiddenRepresentation]:
+        """Extract all requested CNRF views with a single victim prefill."""
+
+        import torch
+
+        if not views:
+            raise ValueError("extract_hidden_views requires at least one view")
+        normalized_views = [(int(layer), str(pooling)) for layer, pooling in views]
+        if len(set(normalized_views)) != len(normalized_views):
+            raise ValueError("extract_hidden_views received duplicate layer/readout views")
+
+        started = time.perf_counter()
+        batch, rendered = self._build_batch(prompt, image_path, system_prompt)
+        batch = self._helpers["move_batch_to_device"](
+            batch,
+            self._helpers["first_param_device"](self.model),
+        )
+        with torch.inference_mode():
+            output = self.model(**batch, output_hidden_states=True, use_cache=False)
+        hidden_states = self._helpers["output_hidden_states"](output)
+        for layer, _ in normalized_views:
+            if layer < 0 or layer >= len(hidden_states):
+                raise ValueError(
+                    f"Requested representation layer {layer}, but model exposed "
+                    f"hidden-state indices 0..{len(hidden_states) - 1}"
+                )
+
+        attention_mask = (
+            batch["attention_mask"].detach().cpu() if "attention_mask" in batch else None
+        )
+        sequence_length = int(hidden_states[normalized_views[0][0]].shape[1])
+        image_mask = self._helpers["image_token_mask"](
+            batch,
+            self.processor_or_tokenizer,
+            self.model,
+            sequence_length,
+        ).detach().cpu()
+        elapsed = time.perf_counter() - started
+        common_metadata = {
+            "elapsed_s": elapsed,
+            "input_tokens": int(batch["input_ids"].shape[1]) if "input_ids" in batch else None,
+            "image_path_present": bool(image_path),
+            "image_token_count": int(image_mask.sum().item()),
+            "shared_forward": True,
+            "view_count": len(normalized_views),
+        }
+        representations: list[HiddenRepresentation] = []
+        for layer, pooling in normalized_views:
+            pooled = self._helpers["pool_hidden"](
+                hidden_states[layer].detach().float().cpu(),
+                attention_mask,
+                pooling,
+                image_mask,
+            )
+            representations.append(
+                HiddenRepresentation(
+                    vector=pooled.numpy(),
+                    rendered_prompt=rendered,
+                    backend=self.backend,
+                    layer=layer,
+                    metadata={**common_metadata, "pooling": pooling},
+                )
+            )
+        return representations
 
     def _hidden_detect_components(self) -> tuple[Any, Any, Any]:
         tokenizer = getattr(self.processor_or_tokenizer, "tokenizer", self.processor_or_tokenizer)
@@ -980,8 +1086,13 @@ def _nested_getattr(obj: Any, path: str) -> Any:
 
 
 def _module_device(module: Any, fallback: Any) -> Any:
+    hook = getattr(module, "_hf_hook", None)
+    execution_device = getattr(hook, "execution_device", None)
+    if execution_device is not None and str(execution_device) != "meta":
+        return execution_device
     try:
-        return next(module.parameters()).device
+        parameter_device = next(module.parameters()).device
+        return fallback if str(parameter_device) == "meta" else parameter_device
     except (AttributeError, StopIteration):
         return fallback
 

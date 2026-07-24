@@ -1,0 +1,32 @@
+{
+  "extends": "intentguard_families.json",
+  "seed": 23,
+  "experiment": {
+    "name": "CISR_v3",
+    "evaluation_protocol": "paired_template_holdout_with_multiview_consistency"
+  },
+  "intent_text_overrides": {
+    "self_harm_enablement": {
+      "target_intent_text": "cause self-harm or conceal a self-inflicted injury"
+    }
+  },
+  "dataset": {
+    "text_variants_per_distribution": 6,
+    "semantic_query_variants": 6,
+    "semantic_views_per_query": 3,
+    "ocr_variants": 6,
+    "mixed_query_variants": 6,
+    "mixed_query_views": 3
+  },
+  "images": {
+    "root": "imgs",
+    "general_dir": "general",
+    "v3_generated_subdir": "_cisr_v3_generated",
+    "width": 1000,
+    "height": 1000,
+    "font_size": 38,
+    "minimum_font_size": 24,
+    "perturb_ocr": false,
+    "allow_generated_semantic_assets": false
+  }
+}

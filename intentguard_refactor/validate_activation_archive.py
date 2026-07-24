@@ -15,6 +15,7 @@ def main() -> int:
     parser.add_argument("--require-multimodal-anchor", action="store_true")
     parser.add_argument("--model")
     parser.add_argument("--backend")
+    parser.add_argument("--pooling")
     parser.add_argument("--quiet", action="store_true", help="Suppress the success message.")
     args = parser.parse_args()
 
@@ -24,6 +25,7 @@ def main() -> int:
         require_multimodal_anchor=args.require_multimodal_anchor,
         expected_model=args.model,
         expected_backend=args.backend,
+        expected_pooling=args.pooling,
     )
     if errors:
         print(format_activation_archive_error(args.activations, errors), file=sys.stderr)

@@ -41,6 +41,7 @@ def activation_archive_errors(
     require_multimodal_anchor: bool = False,
     expected_model: str | None = None,
     expected_backend: str | None = None,
+    expected_pooling: str | None = None,
 ) -> list[str]:
     """Return compatibility errors without loading the large activation tensor."""
     path = Path(path)
@@ -105,6 +106,11 @@ def activation_archive_errors(
                 errors.append(
                     f"backend mismatch: archive={metadata.get('backend')!r}, "
                     f"expected={expected_backend!r}"
+                )
+            if expected_pooling is not None and metadata.get("pooling") != expected_pooling:
+                errors.append(
+                    f"pooling mismatch: archive={metadata.get('pooling')!r}, "
+                    f"expected={expected_pooling!r}"
                 )
 
             if rows is not None and ids_array.ndim == 1:

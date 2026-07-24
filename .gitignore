@@ -11,7 +11,7 @@
 /jailbreak_repro/runs/
 /jailbreak_repro/sourcecode/*-main/
 /jailbreak_repro/sourcecode/*-main.zip
-
+/jailbreak_repro/sourcecode/
 /runs/*smoke*/
 /runs/codecheck_smoke*/
 /runs/_env_smoke*/

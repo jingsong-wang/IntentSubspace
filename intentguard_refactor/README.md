@@ -1,8 +1,9 @@
 # IntentGuard-LRH Refactor
 
 This folder contains the refactored closed-loop pipeline. It reuses the shared
-`src/` model loading and activation utilities; CISR_v2 extends that extractor with
-optional multimodal anchor representations and keeps the judge prompt synchronized.
+`src/` model loading and activation utilities. CISR_v2 remains frozen as the
+anchor-residual baseline; CISR_v3 adds an isolated detection-only path while keeping
+old datasets, artifacts, and run directories unchanged.
 
 ## CISR_v2 Detection Protocol
 
@@ -46,6 +47,122 @@ runs/CISR_v2/<model>/detector/detection_report.md
 The v2 script deliberately stops after held-out detection evaluation. It does not fit a
 new refusal gate or alter the existing hard-refusal intervention.
 
+## CISR_v3 Detection MVP
+
+CISR_v3 writes only to `data/CISR_v3_*` and `runs/CISR_v3/`. It makes four scoped
+changes:
+
+- renders clean, complete OCR without black patches or crossing lines;
+- treats `danger*`/`scenario` as action semantics and `auth_doc*` as evidence
+  semantics; only generated prompt screenshots are OCR carriers;
+- reuses existing family images to build same-query multi-view and generic mixed-query
+  samples, with a view-consistency loss; it does not generate T2I/SVG semantic assets;
+- trains a raw rank-3 coordinate MLP without anchor residual or image-role one-hot
+  features, then calibrates with joint TPR, overall FPR, and hard-benign FPR constraints.
+
+Run the resumable three-model experiment:
+
+```bash
+bash intentguard_refactor/scripts/run_detection_round_v3.sh
+```
+
+By default, v3 runs data generation, activation extraction, and detector training only.
+Original response generation and Gemma3-12B judging are optional because intent-label
+detection does not require them:
+
+```bash
+RUN_GENERATION=1 RUN_JUDGE=1 \
+bash intentguard_refactor/scripts/run_detection_round_v3.sh
+```
+
+Main outputs:
+
+```text
+data/CISR_v3_probe.jsonl
+data/CISR_v3_probe_summary.json
+runs/CISR_v3/<model>/activations_all_layers.npz
+runs/CISR_v3/<model>/detector/detector.npz
+runs/CISR_v3/<model>/detector/detection_results.jsonl
+runs/CISR_v3/<model>/detector/detection_summary.json
+runs/CISR_v3/<model>/detector/detection_report.md
+```
+
+`detection_summary.json` reports `deployment_constraints_met`. A false value means the
+calibration split did not certify the joint safety/utility operating point; the artifact
+is retained for analysis but should not be presented as a deployable hard gate. Set
+`REQUIRE_DEPLOYABLE=1` to make that condition fail the run.
+
+## CISR_v4 Modal Detectors and Selective Routing
+
+CISR_v4 now refits the representation with two isolated training manifests:
+
+- `text`: rows without an image;
+- `multimodal`: rows with a real `image_path`.
+
+The multimodal data adds paired typographic-list OCR examples that reproduce the
+general FigStep mechanism without importing FigStep benchmark rows or assets. The
+target and benign-control images use the same clean layout; only the unsafe action
+versus prevention/refusal intent changes.
+
+Each modality trains pooling candidates independently. Text compares `last` and
+`non_image_mean`; multimodal compares `last`, `image_mean`, and `non_image_mean`.
+`image_mean` uses only explicit image placeholder/token positions. If a model exposes
+vision solely through cross-attention and has no aligned image tokens, that candidate
+fails explicitly and is recorded as unsupported rather than silently using a sequence
+mean. The final bundle selects pooling and layer by validation AUROC/AP only.
+
+Each selected branch then uses the existing two-threshold routing protocol:
+
+- `confident_safe`: normal generation;
+- `review`: trained safe-layer route;
+- `confident_dangerous`: hard refusal.
+
+Build the complete resumable v4 data, pooling candidates, branch detectors, selective
+thresholds, and modal bundle:
+
+```bash
+MODEL_SPECS="qwen25vl7b|Qwen/Qwen2.5-VL-7B-Instruct|qwen2_5_vl|hf" \
+bash intentguard_refactor/scripts/run_detection_round_v4.sh
+```
+
+The default script supports Qwen2.5-VL, Gemma3, and Llama3.2-Vision. Start with one
+model as above because all-layer extraction is repeated for each pooling candidate.
+
+Main outputs:
+
+```text
+data/CISR_v4_probe.jsonl
+data/CISR_v4_text_probe.jsonl
+data/CISR_v4_multimodal_probe.jsonl
+runs/CISR_v4_modal/<model>/candidates/<branch>/<pooling>/...
+runs/CISR_v4_modal/<model>/detector/text_detector.npz
+runs/CISR_v4_modal/<model>/detector/multimodal_detector.npz
+runs/CISR_v4_modal/<model>/detector/detector_bundle.json
+```
+
+Run the three held-out evaluations requested for v4:
+
+```bash
+MODEL_PRESET=qwen25vl7b \
+CISR_DETECTOR=runs/CISR_v4_modal/qwen25vl7b/detector/detector_bundle.json \
+REVIEW_ACTION=monitor \
+bash jailbreak_repro/run_cisr4_modal_eval.sh
+```
+
+`monitor` is the detection-focused setting: confident-dangerous inputs still take the
+hard-refusal path, while review inputs are generated normally and retain their route
+labels. Use `REVIEW_ACTION=hard_refusal` only as the explicit refusal ablation.
+
+The v4 report makes the two unacceptable direct-decision errors first-class metrics:
+`confident_safe_error_rate` (harmful among confident-safe) and
+`confident_dangerous_error_rate` (benign among confident-dangerous). It also reports
+their class-conditional counterparts, harmful unsafe escape and benign hard refusal.
+Cross-platform summaries additionally report probability and route metrics under
+`cisr.by_detector_branch`, including the selected pooling and layer.
+
+Use `--cisr4-review-action monitor` only for detection audits. Complete v4 evaluation
+requires a `CISR_safe_layer_adapter_v1` artifact and its model-specific module path.
+
 ## Layout
 
 ```text
@@ -61,6 +178,8 @@ intentguard_refactor/
   merge_audit.py                         # per-sample original/detection/post audit
   scripts/run_closed_loop_round.ps1      # end-to-end Windows pipeline
   scripts/run_detection_round_v2.sh      # held-out CISR_v2 detector pipeline
+  scripts/run_detection_round_v3.sh      # stable raw-rank3 CISR_v3 detector pipeline
+  scripts/run_detection_round_v4.sh      # modal/pooling CISR_v4 training and bundling
 ```
 
 ## Data
@@ -167,8 +286,11 @@ mixed logical batch is split once by image presence and then restored to input
 order. Lower `JUDGE_BATCH_SIZE` if the judge GPU cannot fit the default batch.
 
 Each stage is resumable. If the expected output file already exists and is
-non-empty, the script reuses it. Set `FORCE=1` to rerun everything, or disable
-individual stages with `RUN_ACTIVATIONS=0`, `RUN_GENERATION=0`,
+non-empty, the script reuses it. Activation NPZ files receive additional schema,
+model/backend, multimodal-anchor, sample-id, and label-alignment checks; an
+incompatible legacy cache is regenerated automatically. Set `FORCE=1` to rerun
+everything, or disable individual stages with
+`RUN_ACTIVATIONS=0`, `RUN_GENERATION=0`,
 `RUN_ORIGINAL_JUDGE=0`, `RUN_SUBSPACES=0`, `RUN_THRESHOLDS=0`,
 `RUN_INTERVENTION=0`, `RUN_POST_JUDGE=0`, or `RUN_AUDIT=0`.
 

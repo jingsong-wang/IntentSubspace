@@ -5,10 +5,21 @@ import shlex
 from pathlib import Path
 
 from jailbreak_repro.run_experiment import BACKEND_CHOICES, MODEL_PRESETS, MODEL_SOURCE_CHOICES, main as run_experiment_main
+from jailbreak_repro.representation_detectors import REPRESENTATION_DEFENSE_CHOICES
 
 
 ATTACK_CHOICES = ["figstep", "csdj", "cs-dj", "jood", "umk"]
-DEFENSE_CHOICES = ["none", "ecso", "cider", "cisr", "adashield", "hiddendetect"]
+DEFENSE_CHOICES = [
+    "none",
+    "ecso",
+    "cider",
+    "cisr",
+    "cisr2",
+    "cisr3",
+    "adashield",
+    "hiddendetect",
+    *REPRESENTATION_DEFENSE_CHOICES,
+]
 
 
 def _model_args(prefix: str, value: str, backend: str, source: str) -> list[str]:

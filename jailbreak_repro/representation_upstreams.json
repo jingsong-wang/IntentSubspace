@@ -1,0 +1,79 @@
+{
+  "schema_version": "representation_upstreams_v1",
+  "checked_date": "2026-07-17",
+  "repositories": [
+    {
+      "method": "hiddendetect",
+      "url": "https://github.com/leigest519/HiddenDetect.git",
+      "ref": "main",
+      "destination": "HiddenDetect-main",
+      "code_status": "official",
+      "required_paths": [
+        "README.md",
+        "code/safety_aware_layers.py",
+        "code/test.py",
+        "code/test_qwen.py",
+        "data/few_shot/few_shot.json"
+      ]
+    },
+    {
+      "method": "nearside",
+      "url": "https://github.com/mob-scu/RADAR-NEARSIDE.git",
+      "ref": "main",
+      "destination": "RADAR-NEARSIDE-main",
+      "code_status": "official_partial_data",
+      "required_paths": [
+        "README.md",
+        "NEARSIDE/get_direction.py",
+        "NEARSIDE/test_direction.py",
+        "RADAR/RADAR_dataset/success_qa.json"
+      ]
+    },
+    {
+      "method": "rcs",
+      "url": "https://github.com/sarendis56/Jailbreak_Detection_RCS.git",
+      "ref": "main",
+      "destination": "Jailbreak_Detection_RCS-main",
+      "code_status": "official",
+      "required_paths": [
+        "README.md",
+        "download_datasets.py",
+        "verify_setup.py",
+        "code/load_datasets.py",
+        "code/kcd.py",
+        "code/mcd.py",
+        "analysis/principled_layer_selection.py"
+      ]
+    },
+    {
+      "method": "vlmguard",
+      "url": "https://github.com/radiolab-ntu/vlmguard.git",
+      "ref": "main",
+      "destination": "vlmguard-main",
+      "code_status": "readme_only",
+      "required_paths": [
+        "README.md"
+      ]
+    },
+    {
+      "method": "sahs",
+      "url": "https://github.com/Ziwei-Zheng/SAHs.git",
+      "ref": "main",
+      "destination": "SAHs-main",
+      "code_status": "readme_only",
+      "required_paths": [
+        "README.md"
+      ]
+    },
+    {
+      "method": "jailneurons",
+      "url": "https://github.com/sweet-shark/JailNeruons.git",
+      "ref": "main",
+      "destination": "JailNeruons-main",
+      "code_status": "official_incomplete",
+      "required_paths": [
+        "README.md"
+      ]
+    }
+  ]
+}

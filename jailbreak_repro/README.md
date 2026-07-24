@@ -25,6 +25,9 @@ Implemented attacks/defenses:
   victim-specific adaptive prompt-pool (`AdaShield-A`) modes.
 - Defense: `HiddenDetect`, using the current victim's vocabulary-projected
   hidden states and victim-specific safety-aware layers.
+- Detection baselines: `NEARSIDE`, `RCS-KCD`, `RCS-MCD`, and `VLMGuard`,
+  exposed through a common model-specific representation artifact and
+  `monitor`/`block` interface.
 
 See `METHOD_FIDELITY.md` before reporting results. It records which adapters are
 paper-grade reproductions and which modes are only transfer/artifact baselines.
@@ -180,8 +183,33 @@ python -m jailbreak_repro.run_experiment \
 
 Profiles are cached at `runs/HiddenDetect/<model-preset>/profile.json`. Each
 response stores all layer scores, selected scores, trapezoidal safety score,
-threshold, and detection. `summary.json` reports AUROC whenever both safe and
-unsafe labels are available, such as XSTest.
+threshold, and detection. `summary.json` reports AUPRC and AUROC whenever both
+safe and unsafe labels are available, such as XSTest.
+
+For a repository-isolated reproduction on all three supported victims, use the
+dedicated launcher. It verifies the released HiddenDetect checkout and 12-shot
+data in `jailbreak_repro/sourcecode/HiddenDetect-main`, reads XSTest from
+`benchmark/XSTest`, and delegates CS-DJ unchanged to the existing attack
+adapter:
+
+```bash
+python -m pip install -r requirements-hiddendetect.txt
+
+bash jailbreak_repro/run_hiddendetect_reproduction.sh \
+  --phase all \
+  --models qwen25vl7b,gemma3_12b,llama32_11b_vision \
+  --sources xstest,csdj
+```
+
+Use `--download-missing` only to clone a missing HiddenDetect checkout or fetch
+a missing XSTest CSV. It never downloads or relocates CS-DJ data. CS-DJ keeps
+using its current `sourcecode/CS-DJ-main` data and shared generated artifacts;
+existing overrides such as `--csdj-image-dir` can be passed after `--`.
+
+The launcher has no RCS preparation, activation, training, or dependency
+preflight. Completed model/source cases are skipped using the official few-shot
+fingerprint, while `--force` explicitly recomputes them. Final tables are
+written as `external_detection_summary.{json,csv,md}` under the output root.
 
 The paper evaluates threshold-free AUROC and explicitly states that
 HiddenDetect does not alter response generation. It does not release a decision
@@ -195,6 +223,134 @@ detector into an active gate, use the explicit non-paper extension:
 
 `block` skips victim generation for detected inputs and returns a fixed refusal,
 while retaining `paper_claim_compatible=false` for the intervention.
+
+## Representation Detector Study
+
+The representation study compares four distinct assumptions against CISR using
+the same all-layer activation archives:
+
+- `nearside`: final-layer paired mean direction and released mean-projection
+  threshold. Its original scope is adversarial-image detection; training it on
+  CISR intent pairs is an explicit core-equation adaptation.
+- `rcs-kcd` and `rcs-mcd`: RCS geometric layer selection, learned projection,
+  and contrastive K-nearest or Mahalanobis scoring. The released RCS source is
+  vendored under `sourcecode/Jailbreak_Detection_RCS-main`.
+- `vlmguard`: low-contamination SVD pseudo-partition followed by the paper's
+  three-layer ReLU prompt classifier. The official repository contained no
+  executable implementation when checked on 2026-07-17, so this is marked as a
+  paper-spec implementation rather than an official-code reproduction.
+
+Train one artifact without touching CISR result directories:
+
+```bash
+python -m jailbreak_repro.train_representation_detector \
+  --activations runs/CISR_v2/qwen25vl7b/activations_all_layers.npz \
+  --method rcs-kcd \
+  --out runs/representation_baselines/CISR_v2/qwen25vl7b/rcs-kcd/detector.npz
+```
+
+Run it through the unified platform in detection-only monitoring mode:
+
+```bash
+python -m jailbreak_repro.run_selected \
+  --victim-model qwen25vl7b \
+  --benchmark XSTest \
+  --defense rcs-kcd \
+  --judge-model none \
+  --representation-detector runs/representation_baselines/CISR_v2/qwen25vl7b/rcs-kcd/detector.npz \
+  --representation-action monitor \
+  --max-new-tokens 1
+```
+
+The resumable matrix launcher covers Qwen2.5-VL-7B, Gemma-3-12B, and
+Llama-3.2-11B-Vision on held-out CISR data, XSTest, and CS-DJ:
+
+```bash
+bash jailbreak_repro/run_representation_detector_study.sh --phase all
+```
+
+Each artifact records whether the score follows released code, a paper
+specification, or only a matched CISR adaptation. External test examples are
+never added to detector training.
+
+### Repository-grade representation reproduction
+
+`run_representation_detector_study.sh` above is the controlled matched-CISR
+comparison. The repository-grade path is separate:
+
+```bash
+python -m jailbreak_repro.sync_representation_upstreams
+bash jailbreak_repro/run_repository_representation_reproductions.sh --help
+```
+
+The upstream audit records the exact git `HEAD` when a real checkout is
+available and verifies the files used by each adapter. It also makes public
+availability limits explicit:
+
+| Method | Public repository state | Training source used by the launcher |
+| --- | --- | --- |
+| HiddenDetect | executable code and official 12-shot data | official 12-shot profile, victim-specific |
+| NEARSIDE | executable code; full RADAR raw image corpus is not released in the repository | matched CISR pairs unless a separately obtained RADAR archive is supplied |
+| RCS-KCD/MCD | executable code and downloaders; four datasets are manual/one-link downloads | exact released 2,000-example training composition |
+| VLMGuard | repository is README-only | paper-spec implementation on the declared matched archive |
+| SAHs | repository is README-only | not presented as an executable reproduction |
+| JailNeurons | code has missing/hard-coded helpers | audited but not presented as a completed reproduction |
+
+Prepare the RCS data with the released downloader and its recommended manual
+archive, then run the complete resumable matrix:
+
+```bash
+python -m pip install -r requirements.txt
+python -m gdown 1V09sherPVm6M0E_J_xz3uJ6IBrZ66cRV -O /tmp/rcs_manual_data.zip
+
+bash jailbreak_repro/run_repository_representation_reproductions.sh \
+  --phase all \
+  --download-data \
+  --manual-data-archive /tmp/rcs_manual_data.zip \
+  --models qwen25vl7b,gemma3_12b,llama32_11b_vision \
+  --methods hiddendetect,nearside,rcs-kcd,rcs-mcd,vlmguard \
+  --sources xstest,csdj
+```
+
+Formal RCS training fails closed unless all released source counts and image
+paths are present. `--allow-incomplete-data` is available only for pipeline
+smoke tests; its artifact is marked `repository-rcs-incomplete` and cannot set
+`paper_training_protocol=true`.
+
+The launcher skips completed model/stage combinations and writes only under
+`runs/representation_repository_repro/`. Its final files are:
+
+```text
+external_detection_summary.json
+external_detection_summary.csv
+external_detection_summary.md
+```
+
+The table reports frozen-threshold AUROC/TPR/FPR. On XSTest, FPR is the safe
+prompt over-detection rate; on CS-DJ, `1-TPR` is the attack miss rate. Neither
+benchmark is used to select a layer, fit a projection, or calibrate a threshold.
+
+### CNRF Oracle ceiling diagnostic
+
+The CNRF Oracle adapter is intentionally separate from the frozen-threshold
+representation reproductions above. It reuses an existing CNRF work directory,
+then lets test/external labels select operating thresholds, counterfactual-axis
+subsets, and candidate arrow-pack subsets. Its outputs are diagnostic ceilings,
+not OOD generalization estimates, and always retain `oracle_only=true` and
+`paper_claim_compatible=false`.
+
+```bash
+WORK=counterfactual_risk_field/work/v2_axes_temp07 \
+MODEL_TAG=qwen25vl7b \
+bash jailbreak_repro/run_cnrf_oracle.sh
+```
+
+Results are written under
+`jailbreak_repro/runs/cnrf_oracle/<model>/<work-name>/`. The `raw/` directory
+contains the complete CNRF axis/pack search, while `summary.json`,
+`summary.csv`, and `summary.md` provide the reproduction-platform view. The
+axis search is exhaustive; the pack search covers LOO-ranked and random
+candidates and is not a global combinatorial optimum.
 
 ## CIDER Defense
 
@@ -302,11 +458,18 @@ Then call CISR from the unified reproduction runner:
 python -m jailbreak_repro.run_experiment \
   --model-preset qwen25vl7b \
   --benchmark HADES \
-  --defense cisr \
+  --defense cisr2 \
   --cisr-detector runs/CISR_v2/qwen25vl7b/detector/detector.npz \
   --judge-mode model \
   --judge-preset gemma3_12b
 ```
+
+Use `--defense cisr3` with a detector from `runs/CISR_v3/`. The legacy
+`--defense cisr` spelling inspects the artifact and is normalized to `cisr2` or
+`cisr3` before the output directory is selected. Explicitly naming the wrong
+version fails before victim-model loading. Results are stored under distinct
+`defense_cisr2/` and `defense_cisr3/` paths, and every response and summary records
+the resolved version.
 
 The detector artifact must match the victim model. A cross-model transfer ablation must
 be made explicit with `--cisr-allow-model-mismatch`. `--cisr-threshold` overrides the
@@ -360,12 +523,95 @@ python -m jailbreak_repro.run_selected \
 Unknown arguments are forwarded to `run_experiment`, so method-specific options
 such as `--csdj-image-dir`, `--jood-scenarios`, or `--umk-mode` still work.
 
+## Unified CNRF Oracle Deployment Evaluation
+
+The deployable Oracle evaluation freezes one artifact per target model. Each
+artifact contains exactly one `image_text` candidate and one `text` candidate,
+both selected with `abstain_safe`, empirical FPR <= 5%, the cross-attack
+`macro_harmful` objective, and a 25-pack budget. The same modality candidate and
+threshold are used for CS-DJ, JOOD, JailbreakV-mini, and XSTest; there is no
+per-benchmark Oracle. This remains an `ORACLE_ONLY` ceiling because test/external
+labels participated in the unified candidate and threshold selection.
+
+Build the Qwen artifact after `run_cnrf_oracle.sh` has completed:
+
+```bash
+python -m jailbreak_repro.build_cnrf_oracle_artifact \
+  --work counterfactual_risk_field/work/v2_axes_temp07 \
+  --model-tag qwen25vl7b \
+  --model-id Qwen/Qwen2.5-VL-7B-Instruct
+```
+
+The builder re-scores all Oracle evaluation rows and fails unless every stored
+group TPR/FPR is reproduced exactly. Then run the aligned full-report matrix and
+judge all responses with Gemma3-12B:
+
+```bash
+bash jailbreak_repro/run_cnrf_oracle_full_eval.sh \
+  --victim-model qwen25vl7b \
+  --judge-model gemma3_12b \
+  --judge-batch-size 8
+```
+
+This evaluates CS-DJ (750), the existing report-aligned JOOD protocol (500),
+JailbreakV-mini (280), and XSTest (450). It writes `summary.json`, `summary.csv`,
+and `summary.md` under
+`jailbreak_repro/runs/cnrf_oracle/<victim>/full_eval/`. Attack rows report
+Gemma-judged ASR. XSTest reports the safe-subset over-refusal rate as well as the
+detector FPR. Pass a different `--jood-max-samples` only when intentionally
+changing the JOOD protocol; `9350` evaluates the repository's entire generated
+JOOD configuration rather than the report-aligned 500-row setting.
+
+For a Gemma3-12B target, first extract Gemma representations and repeat CNRF
+view fitting, Oracle selection, artifact freezing, and the same response/judge
+matrix:
+
+```bash
+python -m ood_intent_study.extract \
+  --manifest counterfactual_risk_field/work/v2_axes_temp07/experiment.jsonl \
+  --out-dir counterfactual_risk_field/work/v2_axes_temp07/activations/gemma3_12b \
+  --model-name gemma3_12b \
+  --model google/gemma-3-12b-it \
+  --model-source modelscope \
+  --backend gemma3 \
+  --layers all \
+  --readouts last,non_image_mean \
+  --dtype bfloat16 \
+  --storage-dtype float32 \
+  --device-map auto \
+  --attn-implementation sdpa \
+  --shard-size 16 \
+  --resume \
+  --fail-fast
+
+python -m counterfactual_risk_field.scripts.run_experiment \
+  --manifest counterfactual_risk_field/work/v2_axes_temp07/experiment.jsonl \
+  --activations counterfactual_risk_field/work/v2_axes_temp07/activations/gemma3_12b \
+  --out-dir counterfactual_risk_field/work/v2_axes_temp07/results/gemma3_12b \
+  --config counterfactual_risk_field/configs/protocol_v2_diverse_axes.json
+
+WORK=counterfactual_risk_field/work/v2_axes_temp07 \
+MODEL_TAG=gemma3_12b \
+bash jailbreak_repro/run_cnrf_oracle.sh
+
+python -m jailbreak_repro.build_cnrf_oracle_artifact \
+  --work counterfactual_risk_field/work/v2_axes_temp07 \
+  --model-tag gemma3_12b \
+  --model-id google/gemma-3-12b-it
+
+bash jailbreak_repro/run_cnrf_oracle_full_eval.sh \
+  --victim-model gemma3_12b \
+  --victim-source modelscope \
+  --judge-model gemma3_12b \
+  --judge-batch-size 8
+```
+
 ## Complete Experiment Matrix
 
 `run_all_experiments.sh` runs every requested attack/benchmark against every
 defense. It produces 36 sequential configurations:
 
-- `figstep`, `csdj`, `jood` x `none`, `ecso`, `cider`, `cisr`, `adashield`, `hiddendetect`.
+- `figstep`, `csdj`, `jood` x `none`, `ecso`, `cider`, selected `cisr2`/`cisr3`, `adashield`, `hiddendetect`.
 - `HADES`, `jailbreakV-mini`, `XSTest` x the same six defenses. Benchmark
   cases are the framework's `attack=none` mode.
 
@@ -398,6 +644,7 @@ bash jailbreak_repro/run_all_experiments.sh \
   --victim-model qwen25vl7b \
   --judge-model qwen25vl7b \
   --judge-batch-size 8 \
+  --cisr-version cisr2 \
   --cisr-detector runs/CISR_v2/qwen25vl7b/detector/detector.npz
 ```
 
@@ -409,6 +656,7 @@ bash jailbreak_repro/run_all_experiments.sh \
   --victim-source modelscope \
   --judge-model qwen25vl7b \
   --judge-batch-size 8 \
+  --cisr-version cisr2 \
   --cisr-detector runs/CISR_v2/gemma3_12b/detector/detector.npz \
   --cider-encoder-model /path/to/llava-1.5-7b-hf
 ```
@@ -420,10 +668,12 @@ bash jailbreak_repro/run_all_experiments.sh \
   --victim-model llava15_7b \
   --judge-model qwen25vl7b \
   --dtype float16 \
+  --cisr-version cisr2 \
   --cisr-detector runs/CISR_v2/llava15_7b/detector/detector.npz
 ```
 
-Train the model-specific CISR detector before enabling `--defense cisr`:
+Train the model-specific CISR detector before enabling `--defense cisr2` or
+`--defense cisr3`:
 
 ```bash
 MODEL_SPECS='llava15_7b|llava-hf/llava-1.5-7b-hf|generic_vlm|hf' \
@@ -729,8 +979,10 @@ The CLI selects the three key axes explicitly:
 --model-source auto|hf|modelscope
 --attack none|figstep|csdj|jood|umk
 --benchmark <name-or-path>
---defense none|ecso|cider|cisr|adashield|hiddendetect
---cisr-detector <runs/CISR_v2/<model>/detector/detector.npz>
+--defense none|ecso|cider|cisr2|cisr3|adashield|hiddendetect|nearside|rcs-kcd|rcs-mcd|vlmguard|cnrf-oracle
+--cisr-detector <runs/CISR_v2|CISR_v3/<model>/detector/detector.npz>
+--representation-detector <runs/representation_baselines/.../detector.npz>
+--representation-action monitor|block
 --adashield-mode static|adaptive
 --hiddendetect-action monitor|block
 ```

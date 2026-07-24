@@ -17,8 +17,11 @@ except ModuleNotFoundError:  # pragma: no cover
         return iterable
 
 
-HIDDENDETECT_PROFILE_FORMAT = "hiddendetect_profile_v1"
-HIDDENDETECT_SCORE_FORMAT = "hiddendetect_refusal_auc_v1"
+HIDDENDETECT_PROFILE_FORMAT = "hiddendetect_profile_v2"
+HIDDENDETECT_SCORE_FORMAT = "hiddendetect_refusal_trapz_or_point_v2"
+HIDDENDETECT_PROTOCOL = "official_12shot_fdv_cross_model_adaptation_v2"
+HIDDENDETECT_SELECTION_RULE = "fdv_above_final_contiguous_hull_v2"
+HIDDENDETECT_AGGREGATION_RULE = "unit_trapezoid_or_singleton_point_v2"
 HIDDENDETECT_REFUSAL_TOKENS = [
     "Sorry",
     "sorry",
@@ -53,10 +56,11 @@ def default_hiddendetect_source_dir() -> Path:
 
 
 def default_hiddendetect_profile_path(model_name: str) -> Path:
-    return repo_root() / "runs" / "HiddenDetect" / slugify(model_name) / "profile.json"
+    return repo_root() / "runs" / "HiddenDetect" / slugify(model_name) / "profile_v2.json"
 
 
 def trapezoid_score(values: list[float]) -> float:
+    """Match the released ``np.trapz`` aggregation exactly."""
     if not values:
         raise ValueError("HiddenDetect requires at least one safety-aware layer")
     if len(values) == 1:
@@ -64,17 +68,32 @@ def trapezoid_score(values: list[float]) -> float:
     return float(sum((left + right) * 0.5 for left, right in zip(values, values[1:])))
 
 
-def select_safety_aware_layers(fdv: list[float]) -> list[int]:
+def hiddendetect_score(values: list[float]) -> float:
+    """Aggregate a valid interval without collapsing a singleton to zero."""
+    if not values:
+        raise ValueError("HiddenDetect requires at least one safety-aware layer")
+    if len(values) == 1:
+        return float(values[0])
+    return trapezoid_score(values)
+
+
+def safety_aware_layer_candidates(fdv: list[float]) -> list[int]:
     if not fdv:
         raise ValueError("HiddenDetect FDV is empty")
     baseline = fdv[-1]
-    layers = [index for index, value in enumerate(fdv) if value > baseline]
-    if not layers:
+    return [index for index, value in enumerate(fdv) if value > baseline]
+
+
+def select_safety_aware_layers(fdv: list[float]) -> list[int]:
+    candidates = safety_aware_layer_candidates(fdv)
+    if not candidates:
         raise ValueError(
             "HiddenDetect found no layers with FDV greater than the final-layer baseline; "
             "the supplied few-shot set does not identify a safety-aware range for this victim."
         )
-    return layers
+    # The released scorer slices F[s:e+1], so its integration domain is a
+    # contiguous interval even when the diagnostic FDV hits are sparse.
+    return list(range(candidates[0], candidates[-1] + 1))
 
 
 def _balanced_threshold(labels: list[int], scores: list[float]) -> tuple[float, dict[str, float]]:
@@ -150,12 +169,17 @@ def load_hiddendetect_fewshot(source_dir: Path, fewshot_file: Path | None = None
 class HiddenDetectProfile:
     format_version: str
     score_format: str
+    protocol: str
     model_id: str
     backend: str
     refusal_tokens: list[str]
     refusal_token_ids: list[int]
     layer_count: int
+    selection_rule: str
+    selection_candidates: list[int]
     safety_aware_layers: list[int]
+    aggregation_rule: str
+    paper_score_compatible: bool
     safe_mean: list[float]
     unsafe_mean: list[float]
     fdv: list[float]
@@ -176,10 +200,42 @@ class HiddenDetectProfile:
                 f"Unsupported HiddenDetect profile format {payload.get('format_version')!r}; "
                 f"expected {HIDDENDETECT_PROFILE_FORMAT!r}."
             )
-        return cls(**payload)
+        profile = cls(**payload)
+        profile.validate()
+        return profile
 
     def save(self, path: Path) -> None:
+        self.validate()
         write_json(path, asdict(self))
+
+    def validate(self) -> None:
+        if self.score_format != HIDDENDETECT_SCORE_FORMAT:
+            raise ValueError(f"Unsupported HiddenDetect score format: {self.score_format!r}")
+        if self.protocol != HIDDENDETECT_PROTOCOL:
+            raise ValueError(f"Unsupported HiddenDetect protocol: {self.protocol!r}")
+        if self.selection_rule != HIDDENDETECT_SELECTION_RULE:
+            raise ValueError(f"Unsupported HiddenDetect selection rule: {self.selection_rule!r}")
+        if self.aggregation_rule != HIDDENDETECT_AGGREGATION_RULE:
+            raise ValueError(f"Unsupported HiddenDetect aggregation rule: {self.aggregation_rule!r}")
+        expected = list(range(self.safety_aware_layers[0], self.safety_aware_layers[-1] + 1)) \
+            if self.safety_aware_layers else []
+        if self.safety_aware_layers != expected:
+            raise ValueError("HiddenDetect safety-aware layers must form a non-empty contiguous interval")
+        if any(index < 0 or index >= self.layer_count for index in self.safety_aware_layers):
+            raise ValueError("HiddenDetect safety-aware layer is outside the victim layer range")
+        if not self.selection_candidates or any(
+            index not in self.safety_aware_layers for index in self.selection_candidates
+        ):
+            raise ValueError("HiddenDetect FDV candidates must be contained in the selected interval")
+        if len(self.safe_mean) != self.layer_count or len(self.unsafe_mean) != self.layer_count:
+            raise ValueError("HiddenDetect calibration means do not match the victim layer count")
+        if len(self.fdv) != self.layer_count:
+            raise ValueError("HiddenDetect FDV does not match the victim layer count")
+        calibration_scores = self.calibration_safe_scores + self.calibration_unsafe_scores
+        if not calibration_scores or any(not math.isfinite(float(score)) for score in calibration_scores):
+            raise ValueError("HiddenDetect calibration scores must be non-empty and finite")
+        if not math.isfinite(float(self.threshold)):
+            raise ValueError("HiddenDetect threshold must be finite")
 
 
 def _mean_rows(rows: list[list[float]]) -> list[float]:
@@ -219,26 +275,44 @@ def build_hiddendetect_profile(
     safe_mean = _mean_rows(safe_rows)
     unsafe_mean = _mean_rows(unsafe_rows)
     fdv = [unsafe - safe for unsafe, safe in zip(unsafe_mean, safe_mean)]
+    candidates = safety_aware_layer_candidates(fdv)
     layers = select_safety_aware_layers(fdv)
-    safe_scores = [trapezoid_score([row[index] for index in layers]) for row in safe_rows]
-    unsafe_scores = [trapezoid_score([row[index] for index in layers]) for row in unsafe_rows]
+    safe_scores = [hiddendetect_score([row[index] for index in layers]) for row in safe_rows]
+    unsafe_scores = [hiddendetect_score([row[index] for index in layers]) for row in unsafe_rows]
     labels = [0] * len(safe_scores) + [1] * len(unsafe_scores)
-    threshold, threshold_metrics = _balanced_threshold(labels, safe_scores + unsafe_scores)
+    calibration_scores = safe_scores + unsafe_scores
+    if len(set(calibration_scores)) < 2:
+        raise RuntimeError(
+            "HiddenDetect calibration produced a constant score. Refusing to write a degenerate detector profile."
+        )
+    threshold, threshold_metrics = _balanced_threshold(labels, calibration_scores)
+    threshold_metrics.update(
+        {
+            "auprc": float(binary_auprc(labels, calibration_scores) or 0.0),
+            "auroc": float(binary_auroc(labels, calibration_scores) or 0.0),
+            "unique_score_count": float(len(set(calibration_scores))),
+        }
+    )
     core = {
         "format_version": HIDDENDETECT_PROFILE_FORMAT,
         "score_format": HIDDENDETECT_SCORE_FORMAT,
+        "protocol": HIDDENDETECT_PROTOCOL,
         "model_id": runner.model_name,
         "model_revision": getattr(runner, "model_revision", None),
         "backend": backend or runner.backend,
         "refusal_tokens": HIDDENDETECT_REFUSAL_TOKENS,
         "refusal_token_ids": token_ids or [],
         "layer_count": len(fdv),
+        "selection_rule": HIDDENDETECT_SELECTION_RULE,
+        "selection_candidates": candidates,
         "safety_aware_layers": layers,
+        "aggregation_rule": HIDDENDETECT_AGGREGATION_RULE,
+        "paper_score_compatible": len(layers) >= 2,
         "safe_mean": safe_mean,
         "unsafe_mean": unsafe_mean,
         "fdv": fdv,
         "threshold": threshold,
-        "threshold_method": "balanced_accuracy_on_official_fewshot_platform_calibration",
+        "threshold_method": "balanced_accuracy_on_official_12shot_platform_calibration_v2",
         "threshold_metrics": threshold_metrics,
         "calibration_safe_scores": safe_scores,
         "calibration_unsafe_scores": unsafe_scores,
@@ -323,7 +397,7 @@ def score_hiddendetect_sample(
     if result.refusal_token_ids != profile.refusal_token_ids:
         raise ValueError("HiddenDetect profile refusal token ids do not match the current victim tokenizer")
     selected = [result.scores[index] for index in profile.safety_aware_layers]
-    score = trapezoid_score(selected)
+    score = hiddendetect_score(selected)
     threshold = profile.threshold if threshold_override is None else float(threshold_override)
     return {
         "score": score,
@@ -331,6 +405,9 @@ def score_hiddendetect_sample(
         "detected": score > threshold,
         "layer_scores": result.scores,
         "selected_scores": selected,
+        "selection_rule": profile.selection_rule,
+        "aggregation_rule": profile.aggregation_rule,
+        "singleton_point_fallback": len(selected) == 1,
         "rendered_prompt": result.rendered_prompt,
         "backend": result.backend,
         "metadata": result.metadata,
@@ -357,11 +434,41 @@ def binary_auroc(labels: list[int], scores: list[float]) -> float | None:
     return (positive_rank_sum - positives * (positives + 1) * 0.5) / (positives * negatives)
 
 
+def binary_auprc(labels: list[int], scores: list[float]) -> float | None:
+    """Match precision_recall_curve followed by trapezoidal AUC."""
+    if len(labels) != len(scores) or not labels:
+        return None
+    positives = sum(int(label) == 1 for label in labels)
+    if positives == 0 or positives == len(labels):
+        return None
+
+    grouped: dict[float, list[int]] = {}
+    for label, score in zip(labels, scores):
+        grouped.setdefault(float(score), []).append(int(label))
+
+    true_positives = 0
+    false_positives = 0
+    previous_recall = 0.0
+    previous_precision = 1.0
+    area = 0.0
+    for score in sorted(grouped, reverse=True):
+        group = grouped[score]
+        true_positives += sum(label == 1 for label in group)
+        false_positives += sum(label == 0 for label in group)
+        recall = true_positives / positives
+        precision = true_positives / (true_positives + false_positives)
+        area += (recall - previous_recall) * (precision + previous_precision) * 0.5
+        previous_recall = recall
+        previous_precision = precision
+    return float(area)
+
+
 def sample_safety_label(sample: dict[str, Any]) -> int | None:
     xstest = str(sample.get("xstest_label") or "").lower()
     if xstest in {"safe", "unsafe"}:
         return 1 if xstest == "unsafe" else 0
-    toxicity = sample.get("toxicity")
-    if toxicity in {0, 1, "0", "1"}:
-        return int(toxicity)
+    for key in ("toxicity", "label"):
+        value = sample.get(key)
+        if value in {0, 1, "0", "1"}:
+            return int(value)
     return None

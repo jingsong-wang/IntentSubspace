@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from .selective import SelectiveThresholds, decide_route
 
 
 OTHER_ROLE = "__other__"
@@ -28,8 +31,15 @@ def build_detector_features(
     has_anchor: np.ndarray,
     image_roles: np.ndarray,
     role_categories: list[str],
+    feature_mode: str = "v2_full",
 ) -> np.ndarray:
     raw = np.asarray(raw_coords, dtype=np.float64)
+    if raw.ndim != 2:
+        raise ValueError(f"raw_coords must be two-dimensional, got shape={raw.shape}")
+    if feature_mode == "raw_rank3":
+        return raw
+    if feature_mode != "v2_full":
+        raise ValueError(f"Unsupported CISR detector feature mode: {feature_mode}")
     residual = np.asarray(residual_coords, dtype=np.float64)
     anchor = np.asarray(has_anchor, dtype=np.float64).reshape(-1, 1)
     roles = np.asarray(image_roles).astype(str)
@@ -65,6 +75,8 @@ def train_tiny_mlp(
     features: np.ndarray,
     labels: np.ndarray,
     sample_weight: np.ndarray | None = None,
+    consistency_groups: np.ndarray | None = None,
+    consistency_weight: float = 0.0,
     hidden_dim: int = 8,
     epochs: int = 1200,
     learning_rate: float = 0.02,
@@ -75,6 +87,23 @@ def train_tiny_mlp(
     y = np.asarray(labels, dtype=np.float64).reshape(-1)
     if len(np.unique(y)) != 2:
         raise ValueError("Tiny MLP requires both target and benign labels in the training split.")
+    if consistency_weight < 0.0:
+        raise ValueError("consistency_weight must be non-negative.")
+
+    consistency_indices: list[np.ndarray] = []
+    if consistency_groups is not None and consistency_weight > 0.0:
+        groups = np.asarray(consistency_groups).astype(str).reshape(-1)
+        if len(groups) != len(y):
+            raise ValueError("consistency_groups must align with training rows.")
+        for group in sorted(set(groups.tolist())):
+            if not group:
+                continue
+            indices = np.where(groups == group)[0]
+            if len(indices) < 2:
+                continue
+            if len(np.unique(y[indices])) != 1:
+                raise ValueError(f"Consistency group {group!r} mixes target and benign labels.")
+            consistency_indices.append(indices)
 
     rng = np.random.default_rng(seed)
     input_dim = int(x.shape[1])
@@ -110,9 +139,25 @@ def train_tiny_mlp(
         data_loss = -np.sum(
             weights * (y * np.log(probabilities + 1e-12) + (1.0 - y) * np.log(1.0 - probabilities + 1e-12))
         ) / normalizer
-        loss = float(data_loss + 0.5 * l2 * (np.sum(weight_1**2) + np.sum(weight_2**2)))
+        consistency_loss = 0.0
+        consistency_gradient = np.zeros_like(logits)
+        if consistency_indices:
+            group_normalizer = float(len(consistency_indices))
+            for indices in consistency_indices:
+                centered = logits[indices] - float(logits[indices].mean())
+                consistency_loss += float(np.mean(centered**2)) / group_normalizer
+                consistency_gradient[indices] += (
+                    2.0 * consistency_weight * centered / (group_normalizer * len(indices))
+                )
+        loss = float(
+            data_loss
+            + consistency_weight * consistency_loss
+            + 0.5 * l2 * (np.sum(weight_1**2) + np.sum(weight_2**2))
+        )
 
-        grad_logits = (weights * (probabilities - y) / normalizer).reshape(-1, 1)
+        grad_logits = (
+            weights * (probabilities - y) / normalizer + consistency_gradient
+        ).reshape(-1, 1)
         grad_weight_2 = hidden.T @ grad_logits + l2 * weight_2
         grad_bias_2 = grad_logits.sum(axis=0)
         grad_hidden = grad_logits @ weight_2.T
@@ -145,6 +190,8 @@ def train_tiny_mlp(
         "hidden_dim": hidden_dim,
         "learning_rate": learning_rate,
         "l2": l2,
+        "consistency_weight": consistency_weight,
+        "consistency_group_count": len(consistency_indices),
         "class_counts": {"0": int(class_counts[0]), "1": int(class_counts[1])},
     }
 
@@ -171,6 +218,19 @@ class CISRDetector:
     calibration_target_tpr: float | None = None
     calibration_target_fpr: float | None = None
     coverage_confidence: float | None = None
+    feature_mode: str = "v2_full"
+    deployment_constraints_met: bool | None = None
+    hard_benign_target_fpr: float | None = None
+    safe_threshold: float | None = None
+    danger_threshold: float | None = None
+    safe_route_enabled: bool | None = None
+    danger_route_enabled: bool | None = None
+    confident_safe_error_upper_bound: float | None = None
+    confident_dangerous_error_upper_bound: float | None = None
+    maximum_confident_safe_error: float | None = None
+    maximum_confident_dangerous_error: float | None = None
+    maximum_harmful_unsafe_escape: float | None = None
+    maximum_benign_hard_refusal: float | None = None
 
     @classmethod
     def load(cls, path: Path | str) -> "CISRDetector":
@@ -188,7 +248,11 @@ class CISRDetector:
             residual_center=np.asarray(data["residual_center"], dtype=np.float64),
             feature_mean=np.asarray(data["feature_mean"], dtype=np.float64),
             feature_std=np.asarray(data["feature_std"], dtype=np.float64),
-            role_categories=[str(value) for value in data["role_categories"].tolist()],
+            role_categories=(
+                [str(value) for value in data["role_categories"].tolist()]
+                if "role_categories" in data
+                else []
+            ),
             network=TinyMLP(
                 np.asarray(data["weight_1"], dtype=np.float64),
                 np.asarray(data["bias_1"], dtype=np.float64),
@@ -218,6 +282,67 @@ class CISRDetector:
                 if "coverage_confidence" in data
                 else None
             ),
+            feature_mode=(
+                str(data["feature_mode"][0]) if "feature_mode" in data else "v2_full"
+            ),
+            deployment_constraints_met=(
+                bool(data["deployment_constraints_met"][0])
+                if "deployment_constraints_met" in data
+                else None
+            ),
+            hard_benign_target_fpr=(
+                float(data["hard_benign_target_fpr"][0])
+                if "hard_benign_target_fpr" in data
+                else None
+            ),
+            safe_threshold=(
+                float(data["safe_threshold"][0]) if "safe_threshold" in data else None
+            ),
+            danger_threshold=(
+                float(data["danger_threshold"][0])
+                if "danger_threshold" in data
+                else None
+            ),
+            safe_route_enabled=(
+                bool(data["safe_route_enabled"][0])
+                if "safe_route_enabled" in data
+                else None
+            ),
+            danger_route_enabled=(
+                bool(data["danger_route_enabled"][0])
+                if "danger_route_enabled" in data
+                else None
+            ),
+            confident_safe_error_upper_bound=(
+                float(data["confident_safe_error_upper_bound"][0])
+                if "confident_safe_error_upper_bound" in data
+                else None
+            ),
+            confident_dangerous_error_upper_bound=(
+                float(data["confident_dangerous_error_upper_bound"][0])
+                if "confident_dangerous_error_upper_bound" in data
+                else None
+            ),
+            maximum_confident_safe_error=(
+                float(data["maximum_confident_safe_error"][0])
+                if "maximum_confident_safe_error" in data
+                else None
+            ),
+            maximum_confident_dangerous_error=(
+                float(data["maximum_confident_dangerous_error"][0])
+                if "maximum_confident_dangerous_error" in data
+                else None
+            ),
+            maximum_harmful_unsafe_escape=(
+                float(data["maximum_harmful_unsafe_escape"][0])
+                if "maximum_harmful_unsafe_escape" in data
+                else None
+            ),
+            maximum_benign_hard_refusal=(
+                float(data["maximum_benign_hard_refusal"][0])
+                if "maximum_benign_hard_refusal" in data
+                else None
+            ),
         )
 
     def score_hidden(
@@ -226,6 +351,8 @@ class CISRDetector:
         image_role: str,
         anchor_hidden: np.ndarray | None = None,
         threshold_override: float | None = None,
+        safe_threshold_override: float | None = None,
+        danger_threshold_override: float | None = None,
     ) -> dict[str, Any]:
         vector = np.asarray(hidden, dtype=np.float64).reshape(-1)
         if vector.shape != self.center.shape:
@@ -249,18 +376,153 @@ class CISRDetector:
             np.array([has_anchor], dtype=bool),
             np.array([image_role or "none"]),
             self.role_categories,
+            feature_mode=self.feature_mode,
         )
         standardized = (features - self.feature_mean[None, :]) / self.feature_std[None, :]
         probability = float(self.network.predict_proba(standardized)[0])
         threshold = self.threshold if threshold_override is None else float(threshold_override)
-        return {
+        result = {
             "probability": probability,
             "threshold": threshold,
             "detected": probability >= threshold,
             "coordinates": raw_coords.astype(float).tolist(),
-            "residual_coordinates": residual_coords.astype(float).tolist(),
+            "residual_coordinates": (
+                residual_coords.astype(float).tolist() if self.feature_mode == "v2_full" else []
+            ),
             "has_anchor": has_anchor,
             "image_role": image_role or "none",
             "layer": self.layer,
             "rank": self.rank,
+            "feature_mode": self.feature_mode,
+            "deployment_constraints_met": self.deployment_constraints_met,
         }
+        if self.safe_threshold is not None and self.danger_threshold is not None:
+            safe_threshold = (
+                self.safe_threshold
+                if safe_threshold_override is None
+                else float(safe_threshold_override)
+            )
+            danger_threshold = (
+                self.danger_threshold
+                if danger_threshold_override is None
+                else float(danger_threshold_override)
+            )
+            thresholds = SelectiveThresholds(
+                safe_max=safe_threshold,
+                danger_min=danger_threshold,
+                safe_enabled=self.safe_route_enabled is not False,
+                danger_enabled=self.danger_route_enabled is not False,
+            )
+            decision = decide_route(
+                probability,
+                thresholds,
+                safe_error_upper_bound=self.confident_safe_error_upper_bound,
+                danger_error_upper_bound=self.confident_dangerous_error_upper_bound,
+            )
+            result.update(decision.to_dict())
+            result.update(
+                {
+                    "safe_threshold": safe_threshold,
+                    "danger_threshold": danger_threshold,
+                    "safe_route_enabled": thresholds.safe_enabled,
+                    "danger_route_enabled": thresholds.danger_enabled,
+                    "detected": decision.route.value == "confident_dangerous",
+                }
+            )
+        return result
+
+
+@dataclass
+class CISRDetectorBundle:
+    path: Path
+    model_id: str
+    model_alias: str
+    text_detector: CISRDetector
+    multimodal_detector: CISRDetector
+    format_version: str = "CISR_v4_detector_bundle_v1"
+
+    @classmethod
+    def load(cls, path: Path | str) -> "CISRDetectorBundle":
+        manifest_path = Path(path).expanduser().resolve()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        format_version = str(manifest.get("format_version", ""))
+        if not format_version.lower().startswith("cisr_v4_detector_bundle"):
+            raise ValueError(f"Unsupported CISR detector bundle format: {format_version!r}")
+        branches = manifest.get("branches")
+        if not isinstance(branches, dict):
+            raise ValueError("CISR detector bundle is missing branches.")
+
+        def child(name: str) -> CISRDetector:
+            entry = branches.get(name)
+            if not isinstance(entry, dict) or not entry.get("detector"):
+                raise ValueError(f"CISR detector bundle is missing {name!r} detector.")
+            child_path = Path(str(entry["detector"]))
+            if not child_path.is_absolute():
+                child_path = manifest_path.parent / child_path
+            detector = CISRDetector.load(child_path)
+            if not detector.format_version.lower().startswith("cisr_v4_detector"):
+                raise ValueError(
+                    f"CISR bundle child {name!r} must be v4, got {detector.format_version!r}."
+                )
+            expected_pooling = str(entry.get("pooling") or detector.pooling)
+            if detector.pooling != expected_pooling:
+                raise ValueError(
+                    f"CISR bundle {name!r} pooling mismatch: manifest={expected_pooling!r}, "
+                    f"detector={detector.pooling!r}."
+                )
+            return detector
+
+        text_detector = child("text")
+        multimodal_detector = child("multimodal")
+        model_ids = {value for value in (text_detector.model_id, multimodal_detector.model_id) if value}
+        manifest_model = str(manifest.get("model_id", ""))
+        if len(model_ids) > 1 or (manifest_model and model_ids and manifest_model not in model_ids):
+            raise ValueError(
+                f"CISR bundle mixes model ids: manifest={manifest_model!r}, children={sorted(model_ids)!r}."
+            )
+        return cls(
+            path=manifest_path,
+            model_id=manifest_model or (next(iter(model_ids)) if model_ids else ""),
+            model_alias=str(manifest.get("model_alias", "")),
+            text_detector=text_detector,
+            multimodal_detector=multimodal_detector,
+            format_version=format_version,
+        )
+
+    def select(self, has_image: bool) -> tuple[str, CISRDetector]:
+        if has_image:
+            return "multimodal", self.multimodal_detector
+        return "text", self.text_detector
+
+    @property
+    def deployment_constraints_met(self) -> bool:
+        return all(
+            detector.deployment_constraints_met is not False
+            for detector in (self.text_detector, self.multimodal_detector)
+        )
+
+    @property
+    def coverage_confidence(self) -> float | None:
+        values = [
+            detector.coverage_confidence
+            for detector in (self.text_detector, self.multimodal_detector)
+            if detector.coverage_confidence is not None
+        ]
+        return min(values) if values else None
+
+    @property
+    def layer(self) -> int:
+        layers = {self.text_detector.layer, self.multimodal_detector.layer}
+        if len(layers) != 1:
+            raise ValueError(
+                "A modal CISR bundle uses different text/multimodal layers and cannot "
+                "share one safe-layer adapter. Use --cisr4-review-action monitor for detection audits."
+            )
+        return next(iter(layers))
+
+
+def load_cisr_detector(path: Path | str) -> CISRDetector | CISRDetectorBundle:
+    artifact_path = Path(path).expanduser().resolve()
+    if artifact_path.suffix.lower() == ".json":
+        return CISRDetectorBundle.load(artifact_path)
+    return CISRDetector.load(artifact_path)

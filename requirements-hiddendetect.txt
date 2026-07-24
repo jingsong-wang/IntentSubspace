@@ -1,0 +1,14 @@
+# HiddenDetect core and the three supported victim backends.
+# This file intentionally excludes RCS/NEARSIDE/VLMGuard training dependencies.
+numpy>=1.24
+torch>=2.1
+torchvision>=0.16
+transformers>=4.50
+accelerate>=0.30
+qwen-vl-utils>=0.0.8
+pillow>=10.0
+sentencepiece>=0.2
+tqdm>=4.66
+modelscope>=1.17
+huggingface-hub>=0.30
+
